@@ -1,14 +1,27 @@
-# 备份文件
-备份/
-*.zip
-
-# 编译生成的文件
+# Build artifacts
+build/
 *.o
-*.bin
+*.a
 *.elf
-*.exe
-*.img
-*.lst
+*.neap
+*.bin
 
-# 日志文件
+# Generated files
+kernel/generated/
+
+# ISO and disk images
+*.iso
+*.img
+
+# Logs and captures
 *.log
+*.pcap
+*.wav
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*~
+*.tmp

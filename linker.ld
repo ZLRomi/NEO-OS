@@ -1,27 +1,36 @@
-ENTRY(_entry)
+OUTPUT_FORMAT(elf32-i386)
+ENTRY(_start)
+
+PHDRS
+{
+    text PT_LOAD FLAGS(5);  /* 5 = R(4) + X(1) ，只读+执行 */
+    data PT_LOAD FLAGS(6);  /* 6 = R(4) + W(2) ，读写，不可执行 */
+}
 
 SECTIONS
 {
     . = 0x100000;
 
-    .text : {
-        entry.o(.text)
-        kernel.o(.text)
+    .text : ALIGN(4K)
+    {
+        *(.multiboot)
         *(.text)
-    }
+    } : text
 
-    .rodata : {
-        *(.rodata*)
-    }
+    .rodata : ALIGN(4K)
+    {
+        *(.rodata)
+    } : text
 
-    .data : {
+    .data : ALIGN(4K)
+    {
         *(.data)
-    }
+    } : data
 
-    .bss : {
+    .bss : ALIGN(4K)
+    {
         *(.bss)
-        *(COMMON)
-    }
+    } : data
 
-    PROVIDE(_kernel_end = .);
+    _end = .;
 }
