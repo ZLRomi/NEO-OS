@@ -41,6 +41,7 @@ prog_dd = []
 prog_kill = []
 prog_fileops = []
 prog_udptest = []
+prog_fork = []
 
 [profile.dev]
 panic = "abort"

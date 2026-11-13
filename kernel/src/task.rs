@@ -78,6 +78,33 @@ global_asm!(
     "iretq",
 );
 
+// Fork child entry: __switch_to "returns" here with rsp pointing at a
+// hand-built frame. Unlike task_entry, this path does NOT run Rust code --
+// it restores the parent's registers and drops straight back to ring3,
+// exactly as if the child had just returned from its own `int 0x80`.
+//
+// Stack layout expected on entry (low → high):
+//   [rdx][rsi][rdi][rax][rcx][r8][r9][r10][r11]   <- 9 saved user regs
+//   [rip][cs][rflags][rsp][ss]                    <- iret frame
+global_asm!(
+    ".globl __fork_child_entry",
+    "__fork_child_entry:",
+    "pop rdx",
+    "pop rsi",
+    "pop rdi",
+    "pop rax",   // already patched to 0 by fork_current
+    "pop rcx",
+    "pop r8",
+    "pop r9",
+    "pop r10",
+    "pop r11",
+    "iretq",
+);
+
+extern "C" {
+    fn __fork_child_entry();
+}
+
 // Dispatch trampoline: pops program index into RDI before iretq.
 // Stack layout when entered: [prog_index][iret frame: rip/cs/rfl/rsp/ss]
 global_asm!(
@@ -448,7 +475,24 @@ pub fn exit() -> ! {
         let cur = CURRENT;
         let t = &mut table()[cur];
         kinfo!("task: id={} exiting", t.id);
-        t.state = State::Exited;
+        // ExitPend, not Exited: the task has finished but its exit status
+        // must stay observable until the parent calls waitpid. Marking it
+        // Exited let reap_exited() clear the slot immediately, so a waiting
+        // parent never observed the state and parked forever.
+        t.state = if t.parent_id != 0 { State::ExitPend } else { State::Exited };
+        let pid = t.id;
+        let parent = t.parent_id;
+        // Wake anyone blocked in waitpid for this child. Without this the
+        // parent only wakes on its own timer, and if the child exited between
+        // the parent's check and its hlt, the parent can miss the wakeup
+        // entirely and park until the next tick -- or forever, when the
+        // scheduler has nothing else to run.
+        wake_task(parent);
+        wake_waiters(pid);
+        // Give back this task's file descriptors. Nothing else does it, and a
+        // leaked fd slot is invisible until the table runs out --- at which
+        // point unrelated processes start failing to open files.
+        crate::vfs::vfs_close_all(pid);
     }
     loop {
         schedule();
@@ -467,7 +511,15 @@ unsafe fn reap_exited() {
             continue;
         }
         let t = &mut table()[i];
-        if t.state != State::Exited {
+        // Only reap tasks nobody is waiting for. A zombie with a parent stays
+        // put until that parent calls waitpid; otherwise the parent would miss
+        // the exit status entirely.
+        let reapable = match t.state {
+            State::Exited => true,
+            State::ExitPend => false,
+            _ => continue,
+        };
+        if !reapable {
             continue;
         }
         let kstack = t.kstack;
@@ -613,6 +665,69 @@ pub fn wake_expired() {
             // task is woken explicitly, never by the clock.
             if dl != 0 && now.wrapping_sub(dl) < (1u64 << 63) {
                 SLEEP_DEADLINE[i] = 0;
+                table()[i].state = State::Ready;
+            }
+        }
+    }
+}
+
+/// Voluntarily give up the CPU so another runnable task can run, then return
+/// when this task is scheduled again.
+///
+/// Safe to call from syscall context: `__switch_to` saves the callee-saved
+/// registers and resumes here later, so the caller's stack frame (including
+/// `do_syscall`'s `SysRegs` pointer) stays intact. No interrupt or `hlt` is
+/// involved, which is what makes it usable with IF clear.
+pub fn yield_now_sched() {
+    unsafe {
+        let cur = CURRENT;
+        // Pick any other runnable task; if there is none the child has not
+        // been created yet or has already finished, so just return and let
+        // the caller re-check its condition.
+        let mut next: Option<usize> = None;
+        for k in 1..=MAX_TASKS {
+            let i = (cur + k) % MAX_TASKS;
+            if table()[i].state == State::Ready {
+                next = Some(i);
+                break;
+            }
+        }
+        let Some(next_idx) = next else { return };
+
+        let cur_slot = core::ptr::addr_of_mut!(table()[cur].rsp_slot);
+        let next_slot = core::ptr::addr_of!(table()[next_idx].rsp_slot);
+        let next_kstack = table()[next_idx].kstack;
+        let next_root = table()[next_idx].root;
+
+        // Make the current task runnable again as soon as it is switched to.
+        table()[cur].state = State::Ready;
+        CURRENT = next_idx;
+        if next_kstack != 0 {
+            crate::gdt::set_rsp0(next_kstack + STACK_PAGES * mem::FRAME);
+        }
+        if next_root != 0 {
+            crate::cpu::write_cr3(next_root);
+        } else {
+            crate::cpu::write_cr3(mem::kernel_pml4());
+        }
+        __switch_to(cur_slot, next_slot);
+        // Resumed later by another switch; restore our own CR3/TSS if needed.
+        let my_root = table()[cur].root;
+        if my_root != 0 {
+            crate::cpu::write_cr3(my_root);
+        }
+        crate::gdt::set_rsp0(table()[cur].kstack + STACK_PAGES * mem::FRAME);
+    }
+}
+
+/// Wake all sleeping tasks. A blocked `waitpid` is not tracked per-target, so
+/// on any child exit we wake every sleeper and let each re-check its own
+/// condition; the loop in `waitpid` is written for exactly that.
+pub fn wake_waiters(_pid: u64) {
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if table()[i].state == State::Sleeping {
+                sleep_clear(i);
                 table()[i].state = State::Ready;
             }
         }
@@ -786,19 +901,87 @@ pub fn fork_current() -> Option<u64> {
             return None;
         }
 
+        // Give the child its OWN stack pages.
+        //
+        // clone_page_table() shares every leaf frame, which is right for code
+        // and COW data, but wrong for the stack: the child would overwrite the
+        // parent's stack the moment it ran. We already copied the contents into
+        // `ustack_phys`, so point the child's stack mapping at those frames.
+        for page in 0..USTACK_PAGES {
+            let virt = USER_STACK_BASE + page * mem::FRAME;
+            let phys = ustack_phys + page * mem::FRAME;
+            unsafe {
+                mem::ensure_private_path(child_root, virt, mem::frames());
+                mem::replace_page(child_root, virt, phys, mem::PROT_UDATA);
+            }
+        }
+
         // Mark user data pages as COW in BOTH parent and child.
         // User code region: 0x400000-0x7FFFFF (read-only, no COW needed)
         // User data/heap: 0x800000-0x9FFFFF (COW)
         crate::mem::mark_pages_cow(parent.root, 0x800000, 0x200000);
         crate::mem::mark_pages_cow(child_root, 0x800000, 0x200000);
 
-        // Set up child task.
-        let child_kstack_top = kstack_base + STACK_PAGES * mem::FRAME;
-        let sp = child_kstack_top - 7 * 8;
-        for k in 0..6 {
-            ((sp + k * 8) as *mut u64).write_volatile(0);
+        // -- Give the child the parent's exact syscall context --------------
+        //
+        // "fork returns twice" means the child resumes *at the point of the
+        // syscall*, in user mode, with its own copy of the address space and
+        // RAX = 0. So instead of running a Rust entry function, we rebuild the
+        // parent's interrupt frame on the child's kernel stack: when
+        // __switch_to pops into __fork_child_entry, that trampoline restores
+        // the saved registers and `iretq`s straight back to ring3.
+        //
+        // The frame addresses come from the entry code, which publishes rbp;
+        // we never guess stack layout.
+        let frame_base = crate::interrupts::SYSCALL_FRAME;
+        if frame_base == 0 {
+            mem::frames().free_frames(kstack_base, STACK_PAGES * mem::FRAME);
+            mem::frames().free_frames(ustack_phys, STACK_PAGES * mem::FRAME);
+            crate::elf::destroy_user_page_table(
+                child_root, &parent.segments, parent.nsegments, ustack_phys, USTACK_PAGES,
+                mem::frames(),
+            );
+            if was { sti(); }
+            return None;
         }
-        ((sp + 48) as *mut u64).write_volatile(task_entry as *const () as u64);
+
+        let fb = frame_base as *const u64;
+        // Nine saved user registers at base-72..base.
+        let user_regs = [fb.sub(9), fb.sub(8), fb.sub(7), fb.sub(6), fb.sub(5),
+                         fb.sub(4), fb.sub(3), fb.sub(2), fb.sub(1)];
+        // CPU iret frame immediately above base+8.
+        let iret = [fb.add(1), fb.add(2), fb.add(3), fb.add(4), fb.add(5)];
+
+        // Child kernel stack frame:
+        //   [r15 r14 r13 r12 rbx rbp]  <- popped by __switch_to
+        //   [ret -> __fork_child_entry]
+        //   [9 user regs][5 iret words]
+        let frame_words = 6 + 1 + 9 + 5;
+        let child_top = kstack_base + STACK_PAGES * mem::FRAME;
+        let sp = child_top - (frame_words * 8);
+
+        let mut w = sp as *mut u64;
+        // callee-saved slots __switch_to will pop
+        for _ in 0..6 {
+            w.write_volatile(0);
+            w = w.add(1);
+        }
+        w.write_volatile(__fork_child_entry as *const () as u64);
+        w = w.add(1);
+        // 9 user registers, in the order __fork_child_entry pops them.
+        for k in 0..9 {
+            let v = user_regs[k].read_volatile();
+            // Slot 3 (rax) is the syscall return value: the child sees 0.
+            w.write_volatile(if k == 3 { 0 } else { v });
+            w = w.add(1);
+        }
+        // iret frame: rip, cs, rflags, rsp, ss. Copied verbatim: the user
+        // stack pointer is already correct because the stack lives at a fixed
+        // virtual address shared by both processes.
+        for k in 0..5 {
+            w.write_volatile(iret[k].read_volatile());
+            w = w.add(1);
+        }
 
         let child_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let child = &mut table()[child_idx];
@@ -848,6 +1031,12 @@ pub fn exec_current(prog_name: &[u8]) -> bool {
         crate::kwarn!("task: exec '{}' not found", core::str::from_utf8(prog_name).unwrap_or("?"));
         return false;
     }
+
+    // An exec replaces the process image, so the old image's descriptors go
+    // away too (POSIX keeps them open across exec for descriptors without
+    // FD_CLOEXEC, but this system has no such flag and leaking them across an
+    // image swap is strictly worse than closing them).
+    crate::vfs::vfs_close_all(unsafe { TASKS[CURRENT].id });
 
     // Destroy old address space and free old stacks.
     let old_root = unsafe { TASKS[CURRENT].root };
@@ -987,24 +1176,78 @@ pub fn kill_pgid(pgid: u64, sig: u32) -> i32 {
 /// This is a busy-wait implementation (no blocking scheduler yet).
 pub fn waitpid(pid: u64) -> Option<u64> {
     let parent_id = unsafe { TASKS[CURRENT].id };
-    // Poll until a matching child exits (max ~5 seconds).
-    for _ in 0..500 {
+
+    // Block until a child exits.
+    //
+    // The old version called `sleep_ms` in a loop, which is `hlt` based and
+    // therefore requires interrupts. Inside a syscall (interrupt gate) IF is
+    // clear, so `hlt` never returned: the parent wedged the CPU and the child
+    // was never scheduled. Waiting must be a scheduler operation, not a delay.
+    loop {
         unsafe {
             for i in 0..MAX_TASKS {
                 let t = &table()[i];
-                if t.parent_id == parent_id && t.state == State::Exited {
+                if t.parent_id == parent_id
+                    && (t.state == State::ExitPend || t.state == State::Exited)
+                {
                     if pid == 0 || t.id == pid {
                         let child_id = t.id;
-                        // Reap: mark slot as empty so it can be reused.
-                        table()[i].state = State::Empty;
+                        // Release the zombie's resources now: the scheduler
+                        // deliberately left an ExitPend task alone, so the
+                        // reaping happens here, at the parent's request.
+                        let (kstack, ustack, root, nseg, segs, stack_phys) = {
+                            let t = &table()[i];
+                            (t.kstack, t.ustack, t.root, t.nsegments, t.segments, t.stack_phys)
+                        };
+                        let t = &mut table()[i];
+                        t.kstack = 0;
+                        t.ustack = 0;
+                        t.root = 0;
+                        t.nsegments = 0;
+                        t.stack_phys = 0;
+                        t.state = State::Empty;
+
+                        if kstack != 0 {
+                            mem::free_frames(kstack, STACK_PAGES * mem::FRAME);
+                        }
+                        if ustack != 0 {
+                            mem::free_frames(ustack, USTACK_PAGES * mem::FRAME);
+                        }
+                        if root != 0 {
+                            let alloc = mem::frames();
+                            for s in 0..nseg {
+                                let seg = &segs[s];
+                                if seg.phys != 0 && seg.len > 0 {
+                                    alloc.free_frames(seg.phys, seg.len.div_ceil(mem::FRAME) * mem::FRAME);
+                                }
+                            }
+                            crate::elf::destroy_user_page_table(
+                                root, &segs, nseg, stack_phys, USTACK_PAGES, alloc,
+                            );
+                        }
                         return Some(child_id);
                     }
                 }
             }
+
+            // Yield the CPU so the child can run, then re-check.
+            //
+            // Two simpler designs both fail here:
+            //   * `sleep_ms` / `hlt` loops need interrupts, and this code runs
+            //     inside an interrupt gate with IF clear, so the CPU would stop
+            //     dead.
+            //   * A Sleeping state woken by the child looked right, but the
+            //     parent's `hlt` only returns on an interrupt; the child's
+            //     exit happens on the same CPU, so nothing interrupts the
+            //     halted parent and it never observes the wakeup.
+            //
+            // Yielding is different: it switches to another runnable task and
+            // comes back when the scheduler picks us again, no interrupt and
+            // no halt involved. The loop re-checks the zombie each time, so
+            // correctness does not depend on wake ordering.
+            crate::task::yield_now_sched();
         }
-        crate::interrupts::sleep_ms(10);
     }
-    None // timeout
 }
 
 /// Clone a PML4 tree, sharing all leaf physical pages.

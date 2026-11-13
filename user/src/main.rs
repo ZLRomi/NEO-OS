@@ -125,6 +125,21 @@ fn sys_getpid() -> u64 {
     sys_call(19, 0, 0, 0)
 }
 
+/// sys_fork() -> child pid in the parent, 0 in the child, -1 on failure.
+fn sys_fork() -> u64 {
+    sys_call(29, 0, 0, 0)
+}
+
+/// sys_waitpid(pid) -> reaped pid, or 0 on timeout.
+fn sys_waitpid(pid: u64) -> i64 {
+    sys_call(30, pid, 0, 0) as i64
+}
+
+/// sys_kill(pid, sig) -> 0 on success.
+fn sys_kill(pid: i64, sig: u32) -> i64 {
+    sys_call(32, pid as u64, sig as u64, 0) as i64
+}
+
 // ---------------------------------------------------------------------------
 // Simple free-list allocator (malloc/free)
 // ---------------------------------------------------------------------------
@@ -1366,6 +1381,60 @@ fn user_fstest() -> ! {
     sys_exit(0);
 }
 
+/// forktest: behavioural test of the process model.
+///
+/// Verifies the parts of fork that are easy to fake and therefore easy to get
+/// wrong:
+///   1. the child observes RAX = 0 and the parent observes the child's pid,
+///   2. both continue executing after the same int 0x80,
+///   3. the child's writes to its data do not disturb the parent (COW),
+///   4. the parent can wait for the child to finish.
+#[cfg(feature = "prog_fork")]
+fn user_forktest() -> ! {
+    sys_write(b"forktest: forking...\n");
+
+    let pid = sys_fork();
+
+    if pid == 0 {
+        // ---- child ----
+        sys_write(b"forktest: child returned 0 (correct)\n");
+        // Mutate a global: with a real address-space copy this must not be
+        // visible to the parent.
+        unsafe { USER_COUNTER = 0xDEAD; }
+        sys_write(b"forktest: child exiting\n");
+        sys_exit(0);
+    }
+
+    if pid == u64::MAX {
+        sys_write(b"forktest: FAIL fork returned -1\n");
+        sys_exit(1);
+    }
+
+    // ---- parent ----
+    sys_write(b"forktest: parent got pid=");
+    sys_print_int(pid as i64);
+    sys_write(b"\n");
+
+    let reaped = sys_waitpid(pid);
+    if reaped != pid as i64 {
+        sys_write(b"forktest: FAIL waitpid returned ");
+        sys_print_int(reaped);
+        sys_write(b"\n");
+        sys_exit(1);
+    }
+
+    let counter = unsafe { USER_COUNTER };
+    if counter != 0x42 {
+        sys_write(b"forktest: FAIL child write leaked into parent: ");
+        sys_print_int(counter as i64);
+        sys_write(b"\n");
+        sys_exit(1);
+    }
+
+    sys_write(b"forktest: ALL PASS\n");
+    sys_exit(0);
+}
+
 /// Nano: simple screen editor with cursor movement.
 /// Arrow keys move cursor, printable chars insert, Esc quits.
 fn user_nano() -> ! {
@@ -1529,6 +1598,7 @@ pub extern "C" fn _start() -> ! {
         feature = "prog_kill",
         feature = "prog_fileops",
         feature = "prog_udptest",
+        feature = "prog_fork",
     ))]
     {
         #[cfg(feature = "prog_bad")]       user_bad();
@@ -1561,6 +1631,7 @@ pub extern "C" fn _start() -> ! {
         #[cfg(feature = "prog_kill")]      user_kill();
         #[cfg(feature = "prog_fileops")]   user_fileops();
         #[cfg(feature = "prog_udptest")]   user_udptest();
+        #[cfg(feature = "prog_fork")]      user_forktest();
     }
 
     #[cfg(not(any(

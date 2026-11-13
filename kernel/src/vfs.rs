@@ -40,7 +40,7 @@ struct OpenFile {
     /// Current read/write position (bytes).
     pos: u32,
     /// Owner task ID (for per-task fd mapping).
-    task_id: u8,
+    task_id: u64,
     /// File descriptor number within the task.
     fd: u8,
     /// Whether this slot is in use.
@@ -71,7 +71,7 @@ static mut OPEN_FILES: [OpenFile; MAX_OPEN_FILES] = {
 /// - `1` — write (create/truncate)
 /// - `2` — read-write
 /// - `3` — append (create if needed, position at end)
-pub fn vfs_open(name: &[u8], flags: u32, task_id: u8) -> i32 {
+pub fn vfs_open(name: &[u8], flags: u32, task_id: u64) -> i32 {
     if name.is_empty() || name.len() > 32 {
         return -1;
     }
@@ -147,7 +147,7 @@ pub fn vfs_open(name: &[u8], flags: u32, task_id: u8) -> i32 {
 }
 
 /// Close a file descriptor.
-pub fn vfs_close(fd: u32, task_id: u8) -> i32 {
+pub fn vfs_close(fd: u32, task_id: u64) -> i32 {
     unsafe {
         for i in 0..MAX_OPEN_FILES {
             if OPEN_FILES[i].active && OPEN_FILES[i].task_id == task_id && OPEN_FILES[i].fd == fd as u8 {
@@ -159,8 +159,25 @@ pub fn vfs_close(fd: u32, task_id: u8) -> i32 {
     -1 // bad fd
 }
 
+/// Release every descriptor owned by `task_id`.
+///
+/// The fd table is a global array keyed by task id, so a task that exits
+/// without closing its files leaks those slots. Nothing used to call this, so
+/// the 32 slots were consumed one process at a time and later opens started
+/// failing with "too many open files" -- which looked like a filesystem bug
+/// but was really an accounting bug.
+pub fn vfs_close_all(task_id: u64) {
+    unsafe {
+        for i in 0..MAX_OPEN_FILES {
+            if OPEN_FILES[i].active && OPEN_FILES[i].task_id == task_id {
+                OPEN_FILES[i].active = false;
+            }
+        }
+    }
+}
+
 /// Read from a file descriptor into buf. Returns bytes read or negative error.
-pub fn vfs_read(fd: u32, buf: &mut [u8], task_id: u8) -> i32 {
+pub fn vfs_read(fd: u32, buf: &mut [u8], task_id: u64) -> i32 {
     let (ino, pos, is_proc) = unsafe {
         let mut found = None;
         for i in 0..MAX_OPEN_FILES {
@@ -211,7 +228,7 @@ pub fn vfs_read(fd: u32, buf: &mut [u8], task_id: u8) -> i32 {
 }
 
 /// Write to a file descriptor from buf. Returns bytes written or negative error.
-pub fn vfs_write(fd: u32, buf: &[u8], task_id: u8) -> i32 {
+pub fn vfs_write(fd: u32, buf: &[u8], task_id: u64) -> i32 {
     let (ino, pos) = unsafe {
         let mut found = None;
         for i in 0..MAX_OPEN_FILES {
@@ -309,7 +326,7 @@ const PROC_SELF_CMDLINE: usize = 5;
 const PROC_SELF_MAPS: usize = 6;
 
 /// Open a /proc virtual file. Returns fd or negative error.
-fn proc_open(path: &[u8], task_id: u8) -> i32 {
+fn proc_open(path: &[u8], task_id: u64) -> i32 {
     let proc_type = match path {
         b"self/status" => PROC_SELF_STATUS,
         b"uptime" => PROC_UPTIME,
@@ -345,7 +362,7 @@ fn proc_open(path: &[u8], task_id: u8) -> i32 {
 }
 
 /// Generate content for a /proc virtual file.
-fn proc_generate(proc_type: usize, task_id: u8) -> [u8; 256] {
+fn proc_generate(proc_type: usize, task_id: u64) -> [u8; 256] {
     let mut buf = [0u8; 256];
     let mut pos = 0usize;
 
@@ -431,7 +448,7 @@ fn proc_generate(proc_type: usize, task_id: u8) -> [u8; 256] {
 }
 
 /// Read from a /proc virtual file.
-fn proc_read(proc_type: usize, task_id: u8, offset: u32, buf: &mut [u8]) -> usize {
+fn proc_read(proc_type: usize, task_id: u64, offset: u32, buf: &mut [u8]) -> usize {
     let content = proc_generate(proc_type, task_id);
     let len = content.iter().position(|&b| b == 0).unwrap_or(256);
     let start = offset as usize;

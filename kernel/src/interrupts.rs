@@ -556,6 +556,11 @@ global_asm!(
     "push rsi",
     "push rdx",
     "and rsp, -16",
+    // Publish the frame base so `fork` can duplicate this exact syscall
+    // context for the child. Without it, fork has to guess the parent's stack
+    // layout, which is not knowable from Rust code.
+    "lea rcx, [rip + SYSCALL_FRAME]",
+    "mov [rcx], rbp",
     "lea rdi, [rbp - 72]", // &SysRegs
     "call do_syscall",
     "mov rsp, rbp",
@@ -579,6 +584,17 @@ global_asm!(
 extern "C" {
     fn __syscall_entry();
 }
+
+/// Frame base (rbp) of the syscall currently being serviced, or 0.
+///
+/// While a syscall runs, this points at the entry frame:
+///   [base-72 .. base]  nine saved user registers (rdx rsi rdi rax rcx r8 r9 r10 r11)
+///   [base+8  .. base+48] CPU iret frame (rip cs rflags rsp ss)
+///
+/// `fork` uses it to give the child the parent's exact user context, which is
+/// what makes "fork returns twice" true instead of merely plausible.
+#[no_mangle]
+pub static mut SYSCALL_FRAME: u64 = 0;
 
 /// User regs spilled by `__syscall_entry` (ascending addresses):
 /// [rbp+8]=rdx (c), +16=rsi (b), +24=rdi (a), +32=rax (nr/ret).
@@ -761,14 +777,14 @@ extern "C" fn do_syscall(regs: &mut SysRegs) {
                 return;
             }
             let name = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, name_len) };
-            let task_id = crate::task::current_id() as u8;
+            let task_id = crate::task::current_id();
             let fd = crate::vfs::vfs_open(name, flags, task_id);
             regs.rax = fd as i64 as u64;
         }
         12 => {
             // sys_close(fd) -> 0 or negative error.
             let fd = regs.rdi as u32;
-            let task_id = crate::task::current_id() as u8;
+            let task_id = crate::task::current_id();
             let ret = crate::vfs::vfs_close(fd, task_id);
             regs.rax = ret as i64 as u64;
         }
@@ -782,7 +798,7 @@ extern "C" fn do_syscall(regs: &mut SysRegs) {
                 regs.rax = (-1i64) as u64;
                 return;
             }
-            let task_id = crate::task::current_id() as u8;
+            let task_id = crate::task::current_id();
             let slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
             let ret = crate::vfs::vfs_read(fd, slice, task_id);
             regs.rax = ret as i64 as u64;
@@ -797,7 +813,7 @@ extern "C" fn do_syscall(regs: &mut SysRegs) {
                 regs.rax = (-1i64) as u64;
                 return;
             }
-            let task_id = crate::task::current_id() as u8;
+            let task_id = crate::task::current_id();
             let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
             let ret = crate::vfs::vfs_write(fd, slice, task_id);
             regs.rax = ret as i64 as u64;

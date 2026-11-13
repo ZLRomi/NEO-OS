@@ -133,9 +133,15 @@ printed a banner.
 
 Tracked so they are not mistaken for finished work:
 
-* `fork` builds the child context, but the child does not yet return from the
-  `int 0x80` frame with `RAX=0`; exit-status plumbing is incomplete.
+* ~~`fork` does not return 0 in the child~~ — fixed. The child now resumes from
+  the parent's duplicated syscall frame with RAX=0, and `waitpid` reaps the
+  zombie. Verified by the `forktest` program (child sees 0, parent sees the pid,
+  COW isolation holds).
 * `mmap` is a stub returning `ENOSYS`.
 * SMP: APs are detected but never scheduled; the run queue is single-CPU.
 * The shell still runs in ring 0 and must move to a ring-3 service.
 * No user/group identity, so permission bits are stored but unenforced.
+* `exec` has no behavioural test yet; `forktest` covers fork/wait/exit only.
+* The file descriptor table is a single global array of 32 entries keyed by
+  task id, not a per-process table with reference counts. It is cleaned up on
+  exit and on exec, but sharing a file between processes is not modelled.
