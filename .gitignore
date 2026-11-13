@@ -21,3 +21,6 @@ net.pcap
 .DS_Store
 Thumbs.db
 *.swp
+
+# Stray tool output
+*.zip
