@@ -1,0 +1,34 @@
+# name            cargo-feature
+# One line per ring-3 program. tools/mkesp.sh and .github/workflows/build.yml
+# both consume this file, so the program set has a single definition.
+user
+userbad           prog_bad
+usernx            prog_nx
+userexec          prog_exec
+userptr           prog_ptr
+isowrite          prog_isowrite
+heaptest          prog_heaptest
+echo              prog_echo
+uptime            prog_uptime
+meminfo           prog_meminfo
+counter           prog_counter
+guess             prog_guess
+edit              prog_edit
+calc              prog_calc
+heapstress        prog_heapstress
+ping              prog_ping
+netdump           prog_netdump
+time              prog_time
+nano              prog_nano
+http              prog_http
+fstest            prog_fstest
+ls                prog_ls
+cat               prog_cat
+hexdump           prog_hexdump
+whoami            prog_whoami
+grep              prog_grep
+ps                prog_ps
+dd                prog_dd
+kill              prog_kill
+fileops           prog_fileops
+udptest           prog_udptest

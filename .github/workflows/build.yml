@@ -1,0 +1,93 @@
+name: build
+
+# Build and boot-test NEO-OS-3 on every push.
+#
+# The image is a UEFI ESP built from the Rust bootloader, the kernel and the
+# ring-3 user programs. GitHub's runners have KVM disabled, so the boot test
+# runs under TCG (software emulation). That is slower but sufficient: we only
+# assert that the kernel reaches its shell and that the sampled subsystems
+# come up, not that timing is representative.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Reproducibility: pin the toolchain here rather than floating on whatever
+  # `nightly` resolves to on the day of the build.
+  RUST_NIGHTLY: nightly-2026-09-24
+  TARGET_KB: x86_64-unknown-none
+  TARGET_EFI: x86_64-unknown-uefi
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            mtools dosfstools ovmf qemu-system-x86 binutils
+
+      - name: Install Rust toolchains
+        run: |
+          rustup toolchain install "$RUST_NIGHTLY" --profile minimal \
+            --component rust-src
+          rustup component add --toolchain "$RUST_NIGHTLY" rust-src llvm-tools
+          rustup target add --toolchain "$RUST_NIGHTLY" "$TARGET_KB"
+          rustup target add --toolchain "$RUST_NIGHTLY" "$TARGET_EFI"
+
+      - name: Cache cargo registry and target dir
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build bootloader
+        run: cargo +"$RUST_NIGHTLY" build -p neo-boot --target "$TARGET_EFI" --release
+
+      - name: Build kernel
+        run: cargo +"$RUST_NIGHTLY" build -p neo-kernel --target "$TARGET_KB" --release
+
+      - name: Build user programs and assemble ESP image
+        # `mkesp.sh --ci` owns the whole user-program loop (driven by
+        # tools/programs.list) so the program set has exactly one definition.
+        run: ./tools/mkesp.sh --ci
+
+      - name: Boot smoke test (QEMU/TCG)
+        # GitHub runners have no /dev/kvm, so QEMU runs under TCG. Guest time
+        # advances far slower than wall time; scale the scripted waits and the
+        # overall timeout accordingly.
+        env:
+          NEO_SKIP_BUILD: "1"
+          NEO_TIME_SCALE: "4"
+          NEO_QEMU_TIMEOUT: "900"
+        run: |
+          set -o pipefail
+          ./tools/run.sh --smoke 2>&1 | tee /tmp/smoke.log
+
+      - name: Upload serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: serial-log
+          path: serial-wsl.log
+          if-no-files-found: warn
+
+      - name: Upload disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp-image
+          path: esp.img
+          retention-days: 7

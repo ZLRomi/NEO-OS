@@ -1,0 +1,21 @@
+# Build artefacts
+target/
+**/target/
+*.img
+*.elf
+*.fd
+*.o
+*.bin
+
+# QEMU / run output
+serial.log
+serial-wsl.log
+qemu-out.txt
+qemu-err.txt
+net.pcap
+*-screen.png
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp

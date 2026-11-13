@@ -1,0 +1,12 @@
+[package]
+name = "neo-kernel"
+version = "3.0.0"
+edition = "2021"
+
+[[bin]]
+name = "neo-kernel"
+path = "src/main.rs"
+
+[dependencies]
+neo-common = { package = "neo-common", path = "../common" }
+spin = "0.12"

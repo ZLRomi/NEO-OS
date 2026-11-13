@@ -1,0 +1,51 @@
+[package]
+name = "neo-user"
+version = "3.0.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "neo-user"
+path = "src/main.rs"
+
+[features]
+default = []
+prog_bad = []
+prog_nx = []
+prog_exec = []
+prog_ptr = []
+prog_isowrite = []
+prog_heaptest = []
+prog_echo = []
+prog_uptime = []
+prog_meminfo = []
+prog_counter = []
+prog_guess = []
+prog_edit = []
+prog_calc = []
+prog_heapstress = []
+prog_ping = []
+prog_netdump = []
+prog_time = []
+prog_nano = []
+prog_http = []
+prog_fstest = []
+prog_ls = []
+prog_cat = []
+prog_hexdump = []
+prog_whoami = []
+prog_grep = []
+prog_ps = []
+prog_dd = []
+prog_kill = []
+prog_fileops = []
+prog_udptest = []
+
+[profile.dev]
+panic = "abort"
+opt-level = 0
+
+[profile.release]
+panic = "abort"
+opt-level = 2
