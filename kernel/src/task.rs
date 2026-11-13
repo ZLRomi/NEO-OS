@@ -370,7 +370,8 @@ fn spawn_user_from_elf_with_index(elf_data: *const u8, elf_len: u64, prog_index:
                 )
             };
 
-            let utop = ubase + USTACK_PAGES * mem::FRAME;
+            // Stack pointer names the fixed virtual address, not the frame.
+            let utop = USER_STACK_TOP;
             // Kernel switch frame then a 5-slot iret frame:
             // [r15 r14 r13 r12 rbx rbp][ret->trampoline][prog_index][rip cs rfl rsp ss]
             // trampoline pops prog_index into RDI, then iretq to ring3 _start.
@@ -897,7 +898,8 @@ pub fn exec_current(prog_name: &[u8]) -> bool {
     };
 
     // Set up new task state in the same slot.
-    let utop = ubase + USTACK_PAGES * mem::FRAME;
+    // exec: same fixed virtual stack top as the spawn path.
+    let utop = USER_STACK_TOP;
     let sp = (kbase + STACK_PAGES * mem::FRAME) - 13 * 8;
     unsafe {
         for k in 0..6 {

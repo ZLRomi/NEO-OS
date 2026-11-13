@@ -32,6 +32,14 @@ elif [ "$EXTRA" = "--smp" ]; then
     echo "== rebuild from source (SMP mode) =="
     bash ./tools/mkesp.sh --ci
   fi
+elif [ "$EXTRA" = "--cmd" ]; then
+  # Run a single shell command after boot, then quit. Used for fast iteration
+  # on one subsystem instead of replaying the whole smoke suite.
+  MODE=cmd
+  EXTRA=""
+  shift || true
+  NEO_CMD="${1:-}"
+  [ -n "$NEO_CMD" ] || { echo "usage: run.sh --cmd '<shell command>'"; exit 2; }
 fi
 
 [ -f esp.img ] || { echo "esp.img missing, run ./tools/mkesp.sh first"; exit 1; }
@@ -146,6 +154,21 @@ set +e
     scale_sleep 2
     send_command ufileops
     scale_sleep 8
+  elif [ "$MODE" = "cmd" ]; then
+    send_command() {
+      local command="$1"
+      local i key
+      for ((i = 0; i < ${#command}; i++)); do
+        key="${command:i:1}"
+        [ "$key" = " " ] && key=spc
+        printf 'sendkey %s\n' "$key"
+        sleep 0.12
+      done
+      printf 'sendkey ret\n'
+      scale_sleep 3
+    }
+    send_command "$NEO_CMD"
+    scale_sleep 6
   elif [ "$MODE" = "smp" ]; then
     # SMP mode: just wait for boot and check AP online.
     scale_sleep 5

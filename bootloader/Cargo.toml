@@ -1,5 +1,6 @@
 [package]
 name = "neo-boot"
+build = "build.rs"
 version = "3.0.0"
 edition = "2021"
 

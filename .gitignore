@@ -5,7 +5,9 @@ target/
 *.elf
 *.fd
 *.o
-*.bin
+# Generated from the checked-in .asm sources by the build (nasm).
+kernel/src/ap_trampoline.bin
+kernel/src/ap_test.bin
 
 # QEMU / run output
 serial.log

@@ -2,6 +2,10 @@
 name = "neo-kernel"
 version = "3.0.0"
 edition = "2021"
+# Assemble the AP trampoline, which is pulled in via include_bytes!.
+# The generated .bin files are build artefacts and are gitignored; the .asm
+# sources are the real input, which keeps a fresh clone buildable.
+build = "build.rs"
 
 [[bin]]
 name = "neo-kernel"

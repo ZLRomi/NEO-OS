@@ -281,7 +281,19 @@ pub unsafe fn load_elf(
         }
     } else {
         // Fallback: synthesize segments from allocatable section headers.
-        for i in 0..e_shnum as usize {
+        //
+        // Sections are mapped *per page*, so two sections that share a page
+        // must end up in the same segment. Mapping them separately makes the
+        // later one overwrite the earlier one's page: `.data` (8 bytes at
+        // 0x802000) and `.got` (at 0x802008) share page 0x802000, and the
+        // `.got` segment used to remap that page to a fresh frame, wiping
+        // `.data`. The result was a process that faulted at rip=0 because the
+        // GOT slot it jumped through had been zeroed.
+        //
+        // Fix: coalesce sections whose page ranges touch or overlap into one
+        // segment, widening flags to the union.
+        let mut i = 0usize;
+        while i < e_shnum as usize {
             let sh_off = e_shoff + (i as u64) * (e_shentsize as u64);
             let sh_ptr = elf_data.add(sh_off as usize);
             let sh_type = read_u32(sh_ptr.add(4));
@@ -289,18 +301,80 @@ pub unsafe fn load_elf(
             let sh_addr = read_u64(sh_ptr.add(16));
             let sh_offset = read_u64(sh_ptr.add(24));
             let sh_size = read_u64(sh_ptr.add(32));
-            if sh_flags & SHF_ALLOC == 0 { continue; }
-            if sh_type != SHT_PROGBITS && sh_type != SHT_NOBITS { continue; }
-            if seg_count >= MAX_SEGMENTS { return Err(ElfError::TooManySegments); }
-            if sh_size == 0 { continue; }
-            // Map section flags to ELF segment flags.
+
+            if sh_flags & SHF_ALLOC == 0
+                || (sh_type != SHT_PROGBITS && sh_type != SHT_NOBITS)
+                || sh_size == 0
+            {
+                i += 1;
+                continue;
+            }
+
             let mut pf: u32 = PF_R;
             if sh_flags & SHF_WRITE != 0 { pf |= PF_W; }
             if sh_flags & SHF_EXECINSTR != 0 { pf |= PF_X; }
-            let filesz = if sh_type == SHT_NOBITS { 0 } else { sh_size };
-            if filesz > 0 && sh_offset + filesz > elf_len { return Err(ElfError::SegmentOutOfBounds); }
-            segs[seg_count] = SegInfo { offset: sh_offset, vaddr: sh_addr, filesz, memsz: sh_size, flags: pf };
+
+            let mut seg_vaddr = sh_addr;
+            let mut seg_off = sh_offset;
+            let mut seg_filesz = if sh_type == SHT_NOBITS { 0 } else { sh_size };
+            let mut seg_memsz = sh_size;
+            let seg_end = sh_addr + sh_size;
+
+            // Absorb following sections that live in the same page range.
+            let mut j = i + 1;
+            while j < e_shnum as usize {
+                let o2 = e_shoff + (j as u64) * (e_shentsize as u64);
+                let p2 = elf_data.add(o2 as usize);
+                let t2 = read_u32(p2.add(4));
+                let f2 = read_u64(p2.add(8));
+                let a2 = read_u64(p2.add(16));
+                let off2 = read_u64(p2.add(24));
+                let sz2 = read_u64(p2.add(32));
+                if f2 & SHF_ALLOC == 0
+                    || (t2 != SHT_PROGBITS && t2 != SHT_NOBITS)
+                    || sz2 == 0
+                {
+                    j += 1;
+                    continue;
+                }
+                // Same page as the current segment?
+                let page = align_up(seg_end, FRAME);
+                if a2 >= page {
+                    break;
+                }
+                // Extend the segment to cover this section.
+                if a2 < seg_vaddr {
+                    let back = seg_vaddr - a2;
+                    seg_vaddr = a2;
+                    seg_off = off2;
+                    seg_filesz += back;
+                    seg_memsz += back;
+                }
+                let new_end = a2 + sz2;
+                if new_end > seg_vaddr + seg_memsz {
+                    seg_memsz = new_end - seg_vaddr;
+                    if t2 != SHT_NOBITS {
+                        seg_filesz = seg_memsz;
+                    }
+                }
+                if f2 & SHF_WRITE != 0 { pf |= PF_W; }
+                if f2 & SHF_EXECINSTR != 0 { pf |= PF_X; }
+                j += 1;
+            }
+
+            if seg_count >= MAX_SEGMENTS { return Err(ElfError::TooManySegments); }
+            if seg_filesz > 0 && seg_off + seg_filesz > elf_len {
+                return Err(ElfError::SegmentOutOfBounds);
+            }
+            segs[seg_count] = SegInfo {
+                offset: seg_off,
+                vaddr: seg_vaddr,
+                filesz: seg_filesz,
+                memsz: seg_memsz,
+                flags: pf,
+            };
             seg_count += 1;
+            i = j;
         }
     }
 
@@ -388,10 +462,21 @@ pub unsafe fn build_user_page_table(
         }
     }
 
-    // Map stack pages.
+    // Map the user stack at a FIXED VIRTUAL ADDRESS, backed by whatever
+    // physical frames the caller allocated.
+    //
+    // The original code used `stack_base` for both the virtual and the
+    // physical address, relying on the identity map. That silently welded the
+    // stack's virtual address to a physical frame number, which has two
+    // consequences: `fork` cannot give a child its own stack (the child's
+    // stack pointer would still name the parent's frames), and the stack's
+    // virtual address changes from run to run as the allocator moves.
+    //
+    // Decoupling them makes the layout process-independent: every process
+    // sees its stack at the same address, but owns different frames.
     for page in 0..stack_pages {
-        let virt = stack_base + page * FRAME;
-        let phys = stack_base + page * FRAME; // identity-mapped
+        let virt = crate::task::USER_STACK_BASE + page * FRAME;
+        let phys = stack_base + page * FRAME;
         mem::ensure_private_path(root, virt, alloc);
         mem::replace_page(root, virt, phys, PROT_UDATA);
     }
@@ -415,7 +500,7 @@ pub unsafe fn destroy_user_page_table(
     root: u64,
     segments: &[ElfSegment; MAX_SEGMENTS],
     nsegments: usize,
-    stack_phys: u64,
+    _stack_phys: u64,
     stack_pages: u64,
     alloc: &mut FrameAlloc,
 ) {
@@ -464,9 +549,11 @@ pub unsafe fn destroy_user_page_table(
             collect_path(seg.vaddr + page * FRAME);
         }
     }
-    // Walk stack pages.
+    // Walk stack pages. The stack lives at a fixed *virtual* address now, so
+    // the walk uses USER_STACK_BASE; `_stack_phys` is kept in the signature
+    // for callers that still free the frames themselves.
     for page in 0..stack_pages {
-        collect_path(stack_phys + page * FRAME);
+        collect_path(crate::task::USER_STACK_BASE + page * FRAME);
     }
 
     // Free collected private intermediate tables.

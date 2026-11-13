@@ -14,6 +14,13 @@ use uefi::proto::console::serial::Serial;
 use uefi::proto::media::file::{File, FileAttribute, FileHandle, FileInfo, FileMode};
 use uefi::{boot, cstr16, println, Status};
 
+/// Program names to stage from /BIN/, generated at build time from
+/// tools/programs.list so the bootloader and the build cannot disagree.
+pub mod program_names_include {
+    include!(concat!(env!("OUT_DIR"), "/program_names.rs"));
+}
+use program_names_include::PROGRAM_NAMES;
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     println!("[BOOT] PANIC: {}", info);
@@ -116,9 +123,15 @@ fn run() -> uefi::Result<()> {
     slog("[BOOT] user ELF read\r\n");
 
     // Load individual user programs from /BIN/.
+    //
+    // The list is generated at build time from tools/programs.list (see
+    // bootloader/build.rs). It used to be hand-maintained here and had drifted
+    // to 17 entries while the build produced 31, so programs such as `ls` were
+    // never staged: spawn_user_by_name then ran on a zeroed UserProg and the
+    // ring-3 task faulted at rip=0 straight after spawn.
     let mut user_progs = [UserProg::ZERO; MAX_USER_PROGS];
     let mut nuser_progs: u64 = 0;
-    let prog_names: &[&str] = &["user", "userbad", "usernx", "userexec", "userptr", "isowrite", "fstest", "ls", "cat", "hexdump", "whoami", "grep", "ps", "dd", "kill", "fileops", "udptest"];
+    let prog_names: &[&str] = PROGRAM_NAMES;
     for name in prog_names.iter() {
         if nuser_progs as usize >= MAX_USER_PROGS { break; }
         // Build path: \BIN\<name>

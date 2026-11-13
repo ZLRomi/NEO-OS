@@ -257,11 +257,15 @@ extern "x86-interrupt" fn page_fault_handler(frame: Frame, code: u64) {
             }
         }
 
+        // Dump the faulting context. rip=0 means control flow was jumped to a
+        // null pointer, which almost always means a return address or an
+        // indirect call target was clobbered -- the registers say which.
         kerror!(
-            "user #PF: killing task addr={:#x} code={:#x} rip={:#x}",
+            "user #PF: killing task addr={:#x} code={:#x} rip={:#x} rsp={:#x}",
             addr,
             code,
-            frame.rip
+            frame.rip,
+            frame.rsp
         );
         crate::task::exit();
     }
@@ -514,28 +518,61 @@ pub fn init() {
 
 // ---- int 0x80 syscalls ----
 
-// Raw entry: spill the user regs used for args/nr, align to 16, call the
-// Rust dispatcher, restore, iretq. Runs on the task's kstack (TSS.RSP0)
-// with IF clear (interrupt gate). Only rax comes back (retval); the rest
-// of the user regs are clobbered per the user ABI.
+// Raw syscall entry.
+//
+// ABI contract: **only RAX changes.** Everything else the caller had in a
+// register must survive the call.
+//
+// The original entry only spilled rax/rdi/rsi/rdx. That silently violated
+// the contract: `do_syscall` is ordinary Rust and, like any C-ABI callee,
+// may clobber rcx, r8, r9, r10 and r11. User code written as
+// `asm!("int 0x80", in("rdi") ..)` does not list those as clobbers, so the
+// compiler happily kept live values in them and they came back corrupted.
+// Symptoms were "impossible" return values (e.g. a syscall returning
+// 0x80000000) and garbage timestamps.
+//
+// Saving the full caller-clobbered set here fixes every user program at
+// once, instead of forcing each one to get its clobber list right.
+//
+// Frame layout. Pushes descend, so the *last* push sits at the lowest
+// address. With rbp pointing at the saved rbp:
+//   rbp-72 rdx   rbp-64 rsi   rbp-56 rdi   rbp-48 rax
+//   rbp-40 rcx   rbp-32 r8    rbp-24 r9    rbp-16 r10   rbp-8 r11
+// SysRegs is #[repr(C)] { rdx, rsi, rdi, rax } with ascending addresses,
+// so it starts exactly at rbp-72 — which is why `lea rdi, [rbp - 72]`
+// hands `do_syscall` the right pointer.
 global_asm!(
     ".globl __syscall_entry",
     "__syscall_entry:",
+    "push rbp",
+    "mov rbp, rsp",
+    "push r11",
+    "push r10",
+    "push r9",
+    "push r8",
+    "push rcx",
     "push rax",
     "push rdi",
     "push rsi",
     "push rdx",
-    "push rbp",
-    "mov rbp, rsp",
     "and rsp, -16",
-    "lea rdi, [rbp + 8]", // &SysRegs { rdx, rsi, rdi, rax }
+    "lea rdi, [rbp - 72]", // &SysRegs
     "call do_syscall",
     "mov rsp, rbp",
+    // Restore every register the call could have touched. rdi/rsi/rdx are
+    // `in` operands of the user's inline asm, which the compiler assumes are
+    // preserved, so they must come back exactly as they went in. rcx/r8-r11
+    // are the C-ABI caller-clobbered set. rax carries the result.
+    "mov rdx, [rbp - 72]",
+    "mov rsi, [rbp - 64]",
+    "mov rdi, [rbp - 56]",
+    "mov rcx, [rbp - 40]",
+    "mov r8,  [rbp - 32]",
+    "mov r9,  [rbp - 24]",
+    "mov r10, [rbp - 16]",
+    "mov r11, [rbp - 8]",
+    "mov rax, [rbp - 48]", // return value written by do_syscall
     "pop rbp",
-    "pop rdx",
-    "pop rsi",
-    "pop rdi",
-    "pop rax", // retval written back into this slot by do_syscall
     "iretq",
 );
 

@@ -1313,15 +1313,37 @@ fn user_fstest() -> ! {
         sys_write(b"fstest: FAIL open for read\n");
         sys_exit(1);
     }
+    sys_write(b"fstest: [2] opened for read\n");
     let mut rbuf = [0u8; 64];
     let n = sys_read(fd as u64, &mut rbuf);
+    sys_write(b"fstest: [3] read returned\n");
     sys_close(fd as u64);
+    sys_write(b"fstest: [4] closed\n");
     if n != data.len() as i64 {
-        sys_write(b"fstest: FAIL read length\n");
+        // Report what actually came back: a bare "FAIL read length" hides
+        // whether this is a syscall error, a short read or a stale fd.
+        sys_write(b"fstest: FAIL read length got=");
+        sys_print_int(n);
+        sys_write(b" want=");
+        sys_print_int(data.len() as i64);
+        sys_write(b"\n");
         sys_exit(1);
     }
-    if &rbuf[..n as usize] != data {
-        sys_write(b"fstest: FAIL read content\n");
+    // Compare byte by byte rather than with `==` on slices. Slice equality
+    // lowers to a `memcmp` call through the GOT, and that builtin has proven
+    // unreliable in this freestanding image. A plain loop is unambiguous and
+    // says exactly which byte disagreed.
+    let mut mismatch: i64 = -1;
+    for i in 0..data.len() {
+        if rbuf[i] != data[i] {
+            mismatch = i as i64;
+            break;
+        }
+    }
+    if mismatch >= 0 {
+        sys_write(b"fstest: FAIL read content at byte ");
+        sys_print_int(mismatch);
+        sys_write(b"\n");
         sys_exit(1);
     }
     sys_write(b"fstest: read+verify OK\n");

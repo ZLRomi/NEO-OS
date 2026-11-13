@@ -53,7 +53,14 @@ pub struct InitrdEntry {
 }
 
 /// Max user programs the bootloader can stage.
-pub const MAX_USER_PROGS: usize = 16;
+///
+/// This must cover `tools/programs.list` in full. It used to be 16 while the
+/// list had grown to 31, so the bootloader silently dropped everything past
+/// the sixteenth entry and `spawn_user_by_name` then ran on a zeroed
+/// `UserProg` (elf_base = 0). The symptom was a ring-3 task faulting at
+/// `rip=0` immediately after spawn. Keep this >= the real program count;
+/// `tools/mkesp.sh` asserts it at build time.
+pub const MAX_USER_PROGS: usize = 64;
 
 /// One staged user program: name + ELF data in memory.
 #[repr(C)]
