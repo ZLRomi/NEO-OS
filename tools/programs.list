@@ -33,3 +33,4 @@ kill              prog_kill
 fileops           prog_fileops
 udptest           prog_udptest
 forktest          prog_fork
+exectest          prog_exectest

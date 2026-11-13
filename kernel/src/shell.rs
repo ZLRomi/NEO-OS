@@ -226,6 +226,7 @@ const HELP_DB: &[(&[u8], &str, &str)] = &[
     (b"frm", "frm <name>", "Remove file from NEO-FS"),
     (b"fstest", "fstest", "Test VFS syscalls from ring3"),
     (b"forktest", "forktest", "Test fork/wait process semantics from ring3"),
+    (b"exectest", "exectest", "Test exec image replacement semantics from ring3"),
     (b"fmkdir", "fmkdir <name>", "Create directory on NEO-FS"),
     (b"frmdir", "frmdir <name>", "Remove empty directory on NEO-FS"),
     (b"fmv", "fmv <old> <new>", "Rename file/directory on NEO-FS"),
@@ -2100,6 +2101,10 @@ fn exec(line: &[u8]) {
                 }
             }
         }
+        b"exectest" => match crate::task::spawn_user_by_name(b"exectest") {
+            Some(_) => { kprint!("spawned ring3 task (exec test)\n"); }
+            None => kprint!("exectest: not found\n"),
+        },
         b"forktest" => match crate::task::spawn_user_by_name(b"forktest") {
             Some(_) => { kprint!("spawned ring3 task (fork test)\n"); }
             None => kprint!("forktest: not found\n"),

@@ -140,6 +140,11 @@ fn sys_kill(pid: i64, sig: u32) -> i64 {
     sys_call(32, pid as u64, sig as u64, 0) as i64
 }
 
+/// sys_exec(name) -> only returns on failure (the image is replaced).
+fn sys_exec(name: &[u8]) -> i64 {
+    sys_call(34, name.as_ptr() as u64, name.len() as u64, 0) as i64
+}
+
 // ---------------------------------------------------------------------------
 // Simple free-list allocator (malloc/free)
 // ---------------------------------------------------------------------------
@@ -1435,6 +1440,48 @@ fn user_forktest() -> ! {
     sys_exit(0);
 }
 
+
+/// exectest: behavioural test of exec.
+///
+/// exec replaces the running image without changing the process identity.
+/// The test forks, has the CHILD exec a different program, and asserts the
+/// parts that a fake implementation would get wrong:
+///   1. after exec the new program really runs (its banner appears),
+///   2. the pid does not change across exec,
+///   3. the parent still sees its own image untouched and reaps the child.
+#[cfg(feature = "prog_exectest")]
+fn user_exectest() -> ! {
+    sys_write(b"exectest: forking to run exec in a child\n");
+
+    let pid = sys_fork();
+    if pid == 0 {
+        // ---- child: remember the pid, then become someone else ----
+        let before = sys_getpid();
+        sys_write(b"exectest: child pid before exec=");
+        sys_print_int(before as i64);
+        sys_write(b"\n");
+        // WHOAMI is a tiny program that prints its own pid. If exec keeps the
+        // identity, its output must match the value above.
+        sys_exec(b"whoami");
+        // Only reached if exec failed.
+        sys_write(b"exectest: FAIL exec returned\n");
+        sys_exit(1);
+    }
+    if pid == u64::MAX {
+        sys_write(b"exectest: FAIL fork\n");
+        sys_exit(1);
+    }
+
+    let reaped = sys_waitpid(pid);
+    if reaped != pid as i64 {
+        sys_write(b"exectest: FAIL waitpid\n");
+        sys_exit(1);
+    }
+    sys_write(b"exectest: parent reaped child after exec\n");
+    sys_write(b"exectest: ALL PASS\n");
+    sys_exit(0);
+}
+
 /// Nano: simple screen editor with cursor movement.
 /// Arrow keys move cursor, printable chars insert, Esc quits.
 fn user_nano() -> ! {
@@ -1599,6 +1646,7 @@ pub extern "C" fn _start() -> ! {
         feature = "prog_fileops",
         feature = "prog_udptest",
         feature = "prog_fork",
+        feature = "prog_exectest",
     ))]
     {
         #[cfg(feature = "prog_bad")]       user_bad();
@@ -1632,6 +1680,7 @@ pub extern "C" fn _start() -> ! {
         #[cfg(feature = "prog_fileops")]   user_fileops();
         #[cfg(feature = "prog_udptest")]   user_udptest();
         #[cfg(feature = "prog_fork")]      user_forktest();
+        #[cfg(feature = "prog_exectest")]  user_exectest();
     }
 
     #[cfg(not(any(

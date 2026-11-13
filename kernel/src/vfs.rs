@@ -49,6 +49,21 @@ struct OpenFile {
     is_proc: bool,
 }
 
+/// Serialises every access to `OPEN_FILES`.
+///
+/// The table is process-shared global state, yet nothing protected it: the
+/// implicit assumption was "single CPU, so it cannot be interrupted". That
+/// stopped being true once waiting became cooperative (`waitpid` yields) and
+/// exec began switching CR3 mid-syscall. The observable symptom was a
+/// flaky fstest -- roughly one run in three failed at a *different* step
+/// (write, then stat) -- which is the signature of a race rather than a bug
+/// in any one operation. ADR-015 had papered over this by lengthening waits;
+/// the waits never removed the window, they only hid it.
+///
+/// The lock disables interrupts while held, so a timer tick cannot preempt
+/// a half-finished table update.
+static VFS_LOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
+
 static mut OPEN_FILES: [OpenFile; MAX_OPEN_FILES] = {
     const EMPTY: OpenFile = OpenFile {
         ino: 0, pos: 0, task_id: 0, fd: 0, active: false, is_proc: false,
@@ -72,6 +87,7 @@ static mut OPEN_FILES: [OpenFile; MAX_OPEN_FILES] = {
 /// - `2` — read-write
 /// - `3` — append (create if needed, position at end)
 pub fn vfs_open(name: &[u8], flags: u32, task_id: u64) -> i32 {
+    let _guard = VFS_LOCK.lock();
     if name.is_empty() || name.len() > 32 {
         return -1;
     }
@@ -148,10 +164,17 @@ pub fn vfs_open(name: &[u8], flags: u32, task_id: u64) -> i32 {
 
 /// Close a file descriptor.
 pub fn vfs_close(fd: u32, task_id: u64) -> i32 {
+    let _guard = VFS_LOCK.lock();
     unsafe {
         for i in 0..MAX_OPEN_FILES {
             if OPEN_FILES[i].active && OPEN_FILES[i].task_id == task_id && OPEN_FILES[i].fd == fd as u8 {
-                OPEN_FILES[i].active = false;
+                // Clear the whole slot, not just `active`. Leaving `ino` and
+                // `task_id` behind meant a later task could observe a stale
+                // entry that still matched its own id, so a closed descriptor
+                // could appear open again.
+                OPEN_FILES[i] = OpenFile {
+                    ino: 0, pos: 0, task_id: 0, fd: 0, active: false, is_proc: false,
+                };
                 return 0;
             }
         }
@@ -167,10 +190,13 @@ pub fn vfs_close(fd: u32, task_id: u64) -> i32 {
 /// failing with "too many open files" -- which looked like a filesystem bug
 /// but was really an accounting bug.
 pub fn vfs_close_all(task_id: u64) {
+    let _guard = VFS_LOCK.lock();
     unsafe {
         for i in 0..MAX_OPEN_FILES {
             if OPEN_FILES[i].active && OPEN_FILES[i].task_id == task_id {
-                OPEN_FILES[i].active = false;
+                OPEN_FILES[i] = OpenFile {
+                    ino: 0, pos: 0, task_id: 0, fd: 0, active: false, is_proc: false,
+                };
             }
         }
     }
@@ -178,6 +204,7 @@ pub fn vfs_close_all(task_id: u64) {
 
 /// Read from a file descriptor into buf. Returns bytes read or negative error.
 pub fn vfs_read(fd: u32, buf: &mut [u8], task_id: u64) -> i32 {
+    let _guard = VFS_LOCK.lock();
     let (ino, pos, is_proc) = unsafe {
         let mut found = None;
         for i in 0..MAX_OPEN_FILES {
@@ -229,6 +256,7 @@ pub fn vfs_read(fd: u32, buf: &mut [u8], task_id: u64) -> i32 {
 
 /// Write to a file descriptor from buf. Returns bytes written or negative error.
 pub fn vfs_write(fd: u32, buf: &[u8], task_id: u64) -> i32 {
+    let _guard = VFS_LOCK.lock();
     let (ino, pos) = unsafe {
         let mut found = None;
         for i in 0..MAX_OPEN_FILES {
@@ -256,7 +284,13 @@ pub fn vfs_write(fd: u32, buf: &[u8], task_id: u64) -> i32 {
             }
             n as i32
         }
-        Err(_) => -2,
+        Err(e) => {
+            // Surface the reason instead of collapsing every failure into -2:
+            // "no free data blocks" and "file too large" need completely
+            // different fixes but look identical to the caller.
+            crate::kwarn!("vfs: write failed: {}", e);
+            -2
+        }
     }
 }
 
@@ -326,6 +360,10 @@ const PROC_SELF_CMDLINE: usize = 5;
 const PROC_SELF_MAPS: usize = 6;
 
 /// Open a /proc virtual file. Returns fd or negative error.
+///
+/// Caller must already hold `VFS_LOCK`: this touches `OPEN_FILES` and is only
+/// reached from `vfs_open`, which takes the lock. Taking it again here would
+/// self-deadlock, so the requirement is stated rather than enforced.
 fn proc_open(path: &[u8], task_id: u64) -> i32 {
     let proc_type = match path {
         b"self/status" => PROC_SELF_STATUS,

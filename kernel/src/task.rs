@@ -190,6 +190,14 @@ const EMPTY_TASK: Task = Task {
 };
 
 static mut TASKS: [Task; MAX_TASKS] = [EMPTY_TASK; MAX_TASKS];
+
+/// Kernel stacks orphaned by `exec`, freed once the task has switched away.
+///
+/// exec replaces the whole image, including the kernel stack, but it runs *on*
+/// that stack. Releasing it immediately would hand a live frame back to the
+/// allocator; instead it is parked here and freed the next time this slot is
+/// reaped or re-used.
+static mut ORPHAN_KSTACK: [u64; MAX_TASKS] = [0; MAX_TASKS];
 static mut CURRENT: usize = 0;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static INITED: AtomicBool = AtomicBool::new(false);
@@ -206,6 +214,15 @@ unsafe fn table() -> &'static mut [Task; MAX_TASKS] {
 /// process — a use-after-free waiting to happen once sleeping existed.
 pub(crate) unsafe fn is_free_slot(i: usize) -> bool {
     i < MAX_TASKS && table()[i].state == State::Empty
+}
+
+/// Free a kernel stack orphaned by exec, if the slot still holds one.
+unsafe fn release_orphan_kstack(i: usize) {
+    let orphan = ORPHAN_KSTACK[i];
+    if orphan != 0 {
+        ORPHAN_KSTACK[i] = 0;
+        mem::free_frames(orphan, STACK_PAGES * mem::FRAME);
+    }
 }
 
 /// Mark the running main context as task 0. Call once after
@@ -253,6 +270,7 @@ pub fn spawn(f: fn()) -> Option<u64> {
             None
         }
         Some(i) => {
+            unsafe { release_orphan_kstack(i) };
             let base = unsafe { mem::frames() }.alloc_contiguous(STACK_PAGES);
             let top = base + STACK_PAGES * mem::FRAME;
             // Crafted switch frame: [r15 r14 r13 r12 rbx rbp][ret->task_entry]
@@ -363,6 +381,7 @@ fn spawn_user_from_elf_with_index(elf_data: *const u8, elf_len: u64, prog_index:
             None
         }
         Some(i) => {
+            unsafe { release_orphan_kstack(i) };
             let kbase = unsafe { mem::frames() }.alloc_contiguous(STACK_PAGES);
             let ktop = kbase + STACK_PAGES * mem::FRAME;
             let ubase = unsafe { mem::frames() }.alloc_contiguous(USTACK_PAGES);
@@ -536,6 +555,12 @@ unsafe fn reap_exited() {
         t.nsegments = 0;
         t.stack_phys = 0;
         t.state = State::Empty;
+        // Release a kernel stack orphaned by an earlier exec on this slot.
+        let orphan = ORPHAN_KSTACK[i];
+        if orphan != 0 {
+            ORPHAN_KSTACK[i] = 0;
+            mem::free_frames(orphan, STACK_PAGES * mem::FRAME);
+        }
         if kstack != 0 {
             mem::free_frames(kstack, STACK_PAGES * mem::FRAME);
         }
@@ -1008,6 +1033,11 @@ pub fn fork_current() -> Option<u64> {
 /// Returns true on success (task image replaced, scheduler will resume new image).
 /// Returns false on failure (not found, load error, OOM).
 pub fn exec_current(prog_name: &[u8]) -> bool {
+    crate::sinfo!(
+        "exec: request '{}' from task {}",
+        core::str::from_utf8(prog_name).unwrap_or("?"),
+        unsafe { TASKS[CURRENT].id }
+    );
     let bi = unsafe { &BI };
     let mut elf_data: *const u8 = core::ptr::null();
     let mut elf_len: u64 = 0;
@@ -1046,27 +1076,27 @@ pub fn exec_current(prog_name: &[u8]) -> bool {
     let old_nsegs = unsafe { TASKS[CURRENT].nsegments };
     let old_stack_phys = unsafe { TASKS[CURRENT].stack_phys };
 
-    // Free old user page table and image.
-    if old_root != 0 && old_nsegs > 0 {
-        unsafe {
-            let alloc = mem::frames();
-            crate::elf::destroy_user_page_table(old_root, &old_segs, old_nsegs, old_stack_phys, USTACK_PAGES, alloc);
-        }
-    }
+    // Do NOT tear down the old address space yet.
+    //
+    // The CPU is executing on `old_root` right now. destroy_user_page_table()
+    // frees the page-table frames the MMU is walking, and free_frames() hands
+    // the user stack back to the allocator -- both while still in use. The
+    // machine triple-faults and reboots. Everything is released after the new
+    // address space is live and the switch has happened.
+    // The kernel stack is KEPT, not replaced.
+    //
+    // We are executing on it right now, inside do_syscall, and the return path
+    // through __syscall_entry depends on its frames staying live. Allocating a
+    // fresh kernel stack and switching to it was the source of two earlier
+    // failures (a freed live stack, then a corrupted switch that rebooted the
+    // machine). Keeping it means exec simply *rewrites the user half* of the
+    // syscall frame and lets the normal return do the rest.
+    let kbase = old_kstack;
 
-    // Free old stacks.
-    if old_kstack != 0 {
-        mem::free_frames(old_kstack, STACK_PAGES * mem::FRAME);
-    }
-    if old_ustack != 0 {
-        mem::free_frames(old_ustack, USTACK_PAGES * mem::FRAME);
-    }
-
-    // Allocate new stacks.
-    let kbase = unsafe { mem::frames() }.alloc_contiguous(STACK_PAGES);
+    // New user stack only.
     let ubase = unsafe { mem::frames() }.alloc_contiguous(USTACK_PAGES);
-    if kbase == 0 || ubase == 0 {
-        crate::kwarn!("task: exec OOM");
+    if ubase == 0 {
+        crate::kwarn!("task: exec OOM (user stack)");
         return false;
     }
 
@@ -1086,42 +1116,82 @@ pub fn exec_current(prog_name: &[u8]) -> bool {
         crate::elf::build_user_page_table(&loaded.segments, loaded.nsegments, ubase, USTACK_PAGES, alloc)
     };
 
-    // Set up new task state in the same slot.
-    // exec: same fixed virtual stack top as the spawn path.
+    // Rewrite the LIVE syscall frame so the normal return lands in the new
+    // image.
+    //
+    // This is the whole trick: exec does not build a new kernel stack or
+    // switch contexts. It edits the frame that __syscall_entry is about to
+    // restore, replacing the user half (saved registers and iret frame) with
+    // the fresh image's entry state. `iretq` then drops to ring3 at the new
+    // program's entry point, with its own CR3 already loaded.
     let utop = USER_STACK_TOP;
-    let sp = (kbase + STACK_PAGES * mem::FRAME) - 13 * 8;
+    let frame_base = unsafe { crate::interrupts::SYSCALL_FRAME };
+    if frame_base == 0 {
+        crate::kwarn!("task: exec without an active syscall frame");
+        return false;
+    }
     unsafe {
-        for k in 0..6 {
-            ((sp + k * 8) as *mut u64).write_volatile(0);
+        let fb = frame_base as *mut u64;
+        // Nine saved user registers at base-72..base, in this order:
+        //   rdx rsi rdi rax rcx r8 r9 r10 r11
+        // Clear them all: the new image starts with no live values, and the
+        // syscall return value (rax) is meaningless to it.
+        for k in 1..=9 {
+            fb.sub(k).write_volatile(0);
         }
-        ((sp + 48) as *mut u64).write_volatile(__user_trampoline_dispatch as *const () as u64);
-        ((sp + 56) as *mut u64).write_volatile(0); // prog_index = 0 (default dispatch)
-        ((sp + 64) as *mut u64).write_volatile(loaded.entry_point);
-        ((sp + 72) as *mut u64).write_volatile(USER_CS as u64);
-        ((sp + 80) as *mut u64).write_volatile(0x202);
-        ((sp + 88) as *mut u64).write_volatile(utop - 8);
-        ((sp + 96) as *mut u64).write_volatile(USER_SS as u64);
+        // CPU iret frame just above base: [rip][cs][rflags][rsp][ss]
+        fb.add(1).write_volatile(loaded.entry_point);
+        fb.add(2).write_volatile(USER_CS as u64);
+        fb.add(3).write_volatile(0x202); // IF set, IOPL 0
+        fb.add(4).write_volatile(utop - 8);
+        fb.add(5).write_volatile(USER_SS as u64);
 
         let cur = CURRENT;
         let t = &mut table()[cur];
         let old_id = t.id;
         let old_parent = t.parent_id;
         let old_pgid = t.pgid;
+        // rsp_slot is NOT touched: it still describes the live kernel stack we
+        // are running on, and __switch_to will save into it normally when this
+        // task is next preempted. Overwriting it here would hand the scheduler
+        // a stack pointer that is not the one currently in use.
         t.state = State::Ready;
-        t.rsp_slot = sp;
         t.kstack = kbase;
         t.ustack = ubase;
         t.root = root;
         t.segments = loaded.segments;
         t.nsegments = loaded.nsegments;
         t.stack_phys = ubase;
+
+        // Activate the new address space now: the rewritten iret frame points
+        // into the new image, so ring3 must be entered under the new CR3.
+        // Both page tables map the kernel and the stack frames identically, so
+        // the switch itself is safe mid-syscall.
+        crate::cpu::write_cr3(root);
+
+        // Only now is it safe to release the old address space: the MMU is no
+        // longer walking its tables and nothing executes on its user stack.
+        if old_root != 0 && old_nsegs > 0 {
+            let alloc = mem::frames();
+            crate::elf::destroy_user_page_table(
+                old_root, &old_segs, old_nsegs, old_stack_phys, USTACK_PAGES, alloc,
+            );
+        }
+        if old_ustack != 0 {
+            mem::free_frames(old_ustack, USTACK_PAGES * mem::FRAME);
+        }
         let mut max_end: u64 = 0;
         for s in 0..loaded.nsegments {
             let seg_end = loaded.segments[s].vaddr + loaded.segments[s].len;
             if seg_end > max_end { max_end = seg_end; }
         }
         t.brk = (max_end + 0xFFF) & !0xFFF;
-        t.id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        // exec does NOT change the process identity. POSIX keeps the pid,
+        // parent and process group: shell job control, waitpid(parent) and any
+        // code that recorded the pid all depend on it. The old implementation
+        // minted a fresh id here, so a parent waiting for its child would wait
+        // forever after the child exec'd.
+        t.id = old_id;
         t.parent_id = old_parent;
         t.pgid = old_pgid;
         // Update task name to new program name.
@@ -1130,10 +1200,7 @@ pub fn exec_current(prog_name: &[u8]) -> bool {
         nbuf[..copy_len].copy_from_slice(&prog_name[..copy_len]);
         t.name = nbuf;
         t.entry = None;
-        kinfo!("task: exec id={} -> id={}", old_id, t.id);
-
-        // The new stack frame is set up in rsp_slot.
-        // When the scheduler switches back to this task, it will resume at the new entry point.
+        kinfo!("task: exec id={} (image replaced, pid kept)", t.id);
     }
     true
 }

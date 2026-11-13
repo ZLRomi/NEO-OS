@@ -167,6 +167,10 @@ set +e
       printf 'sendkey ret\n'
       scale_sleep 3
     }
+    # Give the shell a moment to reach its prompt: the very first synthetic
+    # keystroke is otherwise sometimes consumed during startup, which shows up
+    # as a truncated command (e.g. "exectest" arriving as "ectest").
+    scale_sleep 2
     send_command "$NEO_CMD"
     scale_sleep 6
   elif [ "$MODE" = "smp" ]; then

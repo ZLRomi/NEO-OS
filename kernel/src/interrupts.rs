@@ -559,8 +559,9 @@ global_asm!(
     // Publish the frame base so `fork` can duplicate this exact syscall
     // context for the child. Without it, fork has to guess the parent's stack
     // layout, which is not knowable from Rust code.
-    "lea rcx, [rip + SYSCALL_FRAME]",
-    "mov [rcx], rbp",
+    // rsi = frame base (rbp). Passed explicitly so the dispatcher always
+    // works with *this* call's frame, never a global left over from a fork.
+    "mov rsi, rbp",
     "lea rdi, [rbp - 72]", // &SysRegs
     "call do_syscall",
     "mov rsp, rbp",
@@ -593,8 +594,7 @@ extern "C" {
 ///
 /// `fork` uses it to give the child the parent's exact user context, which is
 /// what makes "fork returns twice" true instead of merely plausible.
-#[no_mangle]
-pub static mut SYSCALL_FRAME: u64 = 0;
+
 
 /// User regs spilled by `__syscall_entry` (ascending addresses):
 /// [rbp+8]=rdx (c), +16=rsi (b), +24=rdi (a), +32=rax (nr/ret).
@@ -609,7 +609,20 @@ struct SysRegs {
 /// Syscall dispatcher (nr in rax): 0=write(fd ignored, buf, len),
 /// 1=exit(code), 2=uptime()->ticks. Called with IF clear.
 #[no_mangle]
-extern "C" fn do_syscall(regs: &mut SysRegs) {
+extern "C" fn do_syscall(regs: &mut SysRegs, frame_base: u64) {
+    // Publish for the duration of this call, cleared on exit. fork copies it;
+    // exec rewrites it. Because it is set from the register the entry code
+    // just computed, it can never describe another task's frame.
+    unsafe { SYSCALL_FRAME = frame_base };
+    do_syscall_inner(regs);
+    unsafe { SYSCALL_FRAME = 0 };
+}
+
+/// Frame base of the syscall currently being serviced, or 0.
+#[no_mangle]
+pub static mut SYSCALL_FRAME: u64 = 0;
+
+fn do_syscall_inner(regs: &mut SysRegs) {
     match regs.rax {
         0 => {
             let len = regs.rdx.min(256) as usize;
