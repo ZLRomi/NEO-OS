@@ -124,6 +124,10 @@ Adding a syscall:
 ./tools/run.sh --smoke     # boot under QEMU and assert boot markers
 ```
 
+Build-time tools beyond a Rust toolchain: `nasm` (assembles the AP
+trampoline), `mtools` and `dosfstools` (pack `esp.img`), `objcopy`,
+`qemu-system-x86_64` and OVMF firmware (boot test). CI installs all of them.
+
 CI (`.github/workflows/build.yml`) runs both on every push. The smoke test is a
 **behavioural** gate: it asserts that ring-3 programs report their own verdicts
 (for example `userptr: invalid buffers rejected`), not merely that the kernel

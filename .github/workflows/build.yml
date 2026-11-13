@@ -33,8 +33,10 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
+          # nasm assembles kernel/src/ap_trampoline.asm in kernel/build.rs;
+          # without it the kernel build fails at build-script time.
           sudo apt-get install -y --no-install-recommends \
-            mtools dosfstools ovmf qemu-system-x86 binutils
+            mtools dosfstools ovmf qemu-system-x86 binutils nasm
 
       - name: Install Rust toolchains
         run: |
